@@ -21,7 +21,7 @@
         <input
           id="messageInput"
           type="text"
-          placeholder="说点什么吧"
+          placeholder="说点什么，比如：我在吃麻辣香锅…"
           autocomplete="off"
         />
         <div class="image-row">
@@ -50,7 +50,8 @@
     const imageInfo = document.getElementById('imageInfo');
     const sendBtn = document.getElementById('sendBtn');
 
-    roomTitle.textContent = `【${roomName}】聊天室`;
+    const baseTitle = `【${roomName}】聊天室`;
+    roomTitle.textContent = baseTitle;
 
     if (!roomId) {
       alert('缺少房间 ID');
@@ -66,8 +67,8 @@
 
     const socket = io();
 
-    // 加入房间
-    socket.emit('joinRoom', roomId);
+    // 加入房间：现在把昵称也发过去，方便统计在线人数
+    socket.emit('joinRoom', { roomId, userName: nickname });
 
     // 收到历史消息
     socket.on('roomHistory', (history) => {
@@ -79,6 +80,16 @@
     socket.on('newMessage', (msg) => {
       addMessageToList(msg);
       scrollToBottom();
+    });
+
+    // 收到在线用户列表（数组：["昵称1", "昵称2", ...]）
+    socket.on('roomUsers', (users) => {
+      const count = Array.isArray(users) ? users.length : 0;
+      if (count <= 0) {
+        roomTitle.textContent = baseTitle;
+      } else {
+        roomTitle.textContent = `${baseTitle}（${count}人在线）`;
+      }
     });
 
     function formatTime(isoString) {

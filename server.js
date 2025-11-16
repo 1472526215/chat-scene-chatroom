@@ -49,7 +49,7 @@ const upload = multer({
   },
 });
 
-// ====== 新增：持久化 rooms 和 messages 到 data.json ======
+// ====== 持久化 rooms 和 messages 到 data.json ======
 
 const dataFile = path.join(__dirname, 'data.json');
 
@@ -88,6 +88,20 @@ function saveData() {
 
 // 启动时先尝试加载历史数据
 loadData();
+
+// ====== 内存里的在线用户：roomId -> { socketId: userName } ======
+
+const roomUsers = {}; // { [roomId]: { [socketId]: userName } }
+
+function getRoomUserNames(roomId) {
+  const users = roomUsers[roomId] || {};
+  return Object.values(users); // [userName, userName2, ...]
+}
+
+function broadcastRoomUsers(roomId) {
+  const names = getRoomUserNames(roomId);
+  io.to(roomId).emit('roomUsers', names);
+}
 
 // ====== 业务逻辑 ======
 
@@ -159,14 +173,33 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// WebSocket 部分：实时聊天
+// ====== WebSocket 部分：实时聊天 + 在线人数 ======
+
 io.on('connection', (socket) => {
   console.log('a user connected', socket.id);
 
-  // 加入房间
-  socket.on('joinRoom', (roomId) => {
+  // 加入房间（现在携带 roomId + userName）
+  socket.on('joinRoom', (payload) => {
+    let roomId;
+    let userName = '游客';
+
+    // 兼容老的写法：只传 roomId 字符串
+    if (typeof payload === 'string') {
+      roomId = payload;
+    } else if (payload && typeof payload === 'object') {
+      roomId = payload.roomId;
+      if (payload.userName) userName = payload.userName;
+    }
+
     if (!roomId) return;
+
     socket.join(roomId);
+
+    // 记录在线用户
+    if (!roomUsers[roomId]) {
+      roomUsers[roomId] = {};
+    }
+    roomUsers[roomId][socket.id] = userName;
 
     // 发历史消息给刚进来的这个人
     const history = messages
@@ -174,6 +207,9 @@ io.on('connection', (socket) => {
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
     socket.emit('roomHistory', history);
+
+    // 广播房间在线用户列表
+    broadcastRoomUsers(roomId);
   });
 
   // 收到消息（文字 + 图片）
@@ -206,6 +242,14 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('user disconnected', socket.id);
+
+    // 从所有房间里移除这个 socket
+    for (const [roomId, users] of Object.entries(roomUsers)) {
+      if (users[socket.id]) {
+        delete users[socket.id];
+        broadcastRoomUsers(roomId);
+      }
+    }
   });
 });
 
