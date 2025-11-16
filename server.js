@@ -79,12 +79,15 @@ if (!process.env.DATABASE_URL) {
   console.error('⚠️ DATABASE_URL 没有配置，服务器仍会启动，但所有数据库操作都会失败。');
 }
 
+// 是否使用 SSL，由环境变量控制（阿里云 RDS 一般不用 SSL）
+const useSSL = process.env.DB_SSL === 'true';
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL
-    ? { rejectUnauthorized: false } // Render 的 Postgres 需要 SSL
-    : undefined,
+  // useSSL 为 true 时走 SSL，否则禁用 SSL（很关键）
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
+
 
 // 启动时保证表存在（双保险，和你手动执行那两条 SQL 一致）
 async function ensureTables() {
