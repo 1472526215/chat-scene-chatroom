@@ -4,33 +4,33 @@ const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// 让 Express 能解析 JSON 请求体
+// 解析 JSON 请求体
 app.use(express.json());
 
-// 静态文件目录：public 里的文件可以直接通过浏览器访问
+// 静态文件目录
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 确保有 uploads 目录，用来存图片
+// ====== 上传图片相关（还是存本地 uploads） ======
+
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
 
-// 让 /uploads 下的文件可以被浏览器访问
 app.use('/uploads', express.static(uploadDir));
 
-// 配置 multer，保存图片到 uploads 目录
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname); // 原始扩展名
+    const ext = path.extname(file.originalname);
     const baseName = Date.now() + '-' + Math.round(Math.random() * 1e9);
     cb(null, baseName + ext);
   },
@@ -45,57 +45,61 @@ const upload = multer({
     cb(null, true);
   },
   limits: {
-    fileSize: 5 * 1024 * 1024, // 最大 5MB
+    fileSize: 5 * 1024 * 1024,
   },
 });
 
-// ====== 持久化 rooms 和 messages 到 data.json ======
+// ====== PostgreSQL 连接池 ======
 
-const dataFile = path.join(__dirname, 'data.json');
-
-// 用 let，这样可以在 loadData 里覆写
-let rooms = [];     // { id, name, createdAt }
-let messages = [];  // { id, roomId, userName, text, imageUrl, createdAt }
-
-function loadData() {
-  try {
-    if (fs.existsSync(dataFile)) {
-      const raw = fs.readFileSync(dataFile, 'utf-8');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed.rooms)) rooms = parsed.rooms;
-        if (Array.isArray(parsed.messages)) messages = parsed.messages;
-        console.log(
-          `Loaded ${rooms.length} rooms and ${messages.length} messages from data.json`
-        );
-      }
-    } else {
-      console.log('data.json not found, starting with empty data');
-    }
-  } catch (err) {
-    console.error('Error loading data.json:', err);
-  }
+if (!process.env.DATABASE_URL) {
+  console.error('⚠️ DATABASE_URL 没有配置，服务器仍会启动，但所有数据库操作都会失败。');
 }
 
-function saveData() {
-  const payload = { rooms, messages };
-  fs.writeFile(dataFile, JSON.stringify(payload, null, 2), (err) => {
-    if (err) {
-      console.error('Error saving data.json:', err);
-    }
-  });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false } // Render 的 Postgres 需要 SSL
+    : undefined,
+});
+
+// 启动时保证表存在（双保险，和你手动执行那两条 SQL 一致）
+async function ensureTables() {
+  const sql = `
+  CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    user_name TEXT NOT NULL,
+    text TEXT,
+    image_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  `;
+  await pool.query(sql);
+  console.log('DB tables are ready');
 }
 
-// 启动时先尝试加载历史数据
-loadData();
+ensureTables().catch((err) => {
+  console.error('Error ensuring tables:', err);
+});
 
-// ====== 内存里的在线用户：roomId -> { socketId: userName } ======
+// 生成 ID 的小工具
+function genId() {
+  return Date.now().toString() + Math.random().toString(36).slice(2);
+}
 
-const roomUsers = {}; // { [roomId]: { [socketId]: userName } }
+// ====== 在线用户（内存里）：roomId -> { socketId: userName } ======
+
+const roomUsers = {};
 
 function getRoomUserNames(roomId) {
   const users = roomUsers[roomId] || {};
-  return Object.values(users); // [userName, userName2, ...]
+  return Object.values(users);
 }
 
 function broadcastRoomUsers(roomId) {
@@ -103,57 +107,106 @@ function broadcastRoomUsers(roomId) {
   io.to(roomId).emit('roomUsers', names);
 }
 
-// ====== 业务逻辑 ======
+// ====== 业务接口：房间 & 消息 ======
 
-function findRoomByName(name) {
-  return rooms.find((r) => r.name === name);
-}
-
-// 获取房间列表（支持 ?q= 关键字搜索）
-app.get('/api/rooms', (req, res) => {
+// GET /api/rooms?q=关键字
+app.get('/api/rooms', async (req, res) => {
   const q = (req.query.q || '').trim();
+  try {
+    let result;
+    if (!q) {
+      result = await pool.query(
+        'SELECT id, name, created_at FROM rooms ORDER BY created_at DESC'
+      );
+    } else {
+      result = await pool.query(
+        'SELECT id, name, created_at FROM rooms WHERE name LIKE $1 ORDER BY created_at DESC',
+        [`%${q}%`]
+      );
+    }
 
-  if (!q) {
-    // 没有关键词就返回全部房间
-    return res.json(rooms);
+    const rooms = result.rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      createdAt: r.created_at,
+    }));
+
+    res.json(rooms);
+  } catch (err) {
+    console.error('Error fetching rooms:', err);
+    res.status(500).json({ error: 'db_error' });
   }
-
-  const matched = rooms.filter((r) => r.name.includes(q));
-  res.json(matched);
 });
 
-// 创建房间（如果同名已存在就直接返回原来的）
-app.post('/api/rooms', (req, res) => {
+// POST /api/rooms  body: { name }
+app.post('/api/rooms', async (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) {
     return res.status(400).json({ error: 'name is required' });
   }
 
-  let existing = findRoomByName(name);
-  if (existing) {
-    return res.json(existing);
+  try {
+    // 先看有没有同名房间
+    let result = await pool.query(
+      'SELECT id, name, created_at FROM rooms WHERE name = $1 LIMIT 1',
+      [name]
+    );
+
+    if (result.rows.length > 0) {
+      const r = result.rows[0];
+      return res.json({
+        id: r.id,
+        name: r.name,
+        createdAt: r.created_at,
+      });
+    }
+
+    // 没有就创建
+    const id = genId();
+    result = await pool.query(
+      'INSERT INTO rooms (id, name) VALUES ($1, $2) RETURNING id, name, created_at',
+      [id, name]
+    );
+
+    const room = {
+      id: result.rows[0].id,
+      name: result.rows[0].name,
+      createdAt: result.rows[0].created_at,
+    };
+
+    res.status(201).json(room);
+  } catch (err) {
+    console.error('Error creating room:', err);
+    res.status(500).json({ error: 'db_error' });
   }
-
-  const room = {
-    id: Date.now().toString() + Math.random().toString(36).slice(2),
-    name,
-    createdAt: new Date().toISOString(),
-  };
-
-  rooms.push(room);
-  saveData(); // ★ 保存到 data.json
-
-  res.status(201).json(room);
 });
 
-// 获取某个房间的历史消息
-app.get('/api/rooms/:id/messages', (req, res) => {
-  const { id } = req.params;
-  const roomMessages = messages
-    .filter((m) => m.roomId === id)
-    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+// GET /api/rooms/:id/messages  获取历史消息
+app.get('/api/rooms/:id/messages', async (req, res) => {
+  const roomId = req.params.id;
+  try {
+    const result = await pool.query(
+      `SELECT id, room_id, user_name, text, image_url, created_at
+       FROM messages
+       WHERE room_id = $1
+       ORDER BY created_at ASC`,
+      [roomId]
+    );
 
-  res.json(roomMessages);
+    const msgs = result.rows.map((m) => ({
+      id: m.id,
+      roomId: m.room_id,
+      userName: m.user_name,
+      text: m.text,
+      imageUrl: m.image_url,
+      createdAt: m.created_at,
+    }));
+
+    res.json(msgs);
+  } catch (err) {
+    console.error('Error fetching messages:', err);
+    res.status(500).json({ error: 'db_error' });
+  }
 });
 
 // 图片上传接口
@@ -161,11 +214,11 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '没有收到文件' });
   }
-  const url = '/uploads/' + req.file.filename; // 浏览器可访问的地址
+  const url = '/uploads/' + req.file.filename;
   res.json({ url });
 });
 
-// 处理上传相关错误
+// 上传错误处理
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError || err.message === '只允许上传图片') {
     return res.status(400).json({ error: err.message });
@@ -173,17 +226,16 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== WebSocket 部分：实时聊天 + 在线人数 ======
+// ====== WebSocket：聊天 + 在线人数 ======
 
 io.on('connection', (socket) => {
   console.log('a user connected', socket.id);
 
-  // 加入房间（现在携带 roomId + userName）
-  socket.on('joinRoom', (payload) => {
+  // 加入房间（携带 roomId + userName）
+  socket.on('joinRoom', async (payload) => {
     let roomId;
     let userName = '游客';
 
-    // 兼容老的写法：只传 roomId 字符串
     if (typeof payload === 'string') {
       roomId = payload;
     } else if (payload && typeof payload === 'object') {
@@ -195,55 +247,84 @@ io.on('connection', (socket) => {
 
     socket.join(roomId);
 
-    // 记录在线用户
     if (!roomUsers[roomId]) {
       roomUsers[roomId] = {};
     }
     roomUsers[roomId][socket.id] = userName;
 
-    // 发历史消息给刚进来的这个人
-    const history = messages
-      .filter((m) => m.roomId === roomId)
-      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    try {
+      const result = await pool.query(
+        `SELECT id, room_id, user_name, text, image_url, created_at
+         FROM messages
+         WHERE room_id = $1
+         ORDER BY created_at ASC`,
+        [roomId]
+      );
 
-    socket.emit('roomHistory', history);
+      const history = result.rows.map((m) => ({
+        id: m.id,
+        roomId: m.room_id,
+        userName: m.user_name,
+        text: m.text,
+        imageUrl: m.image_url,
+        createdAt: m.created_at,
+      }));
 
-    // 广播房间在线用户列表
+      socket.emit('roomHistory', history);
+    } catch (err) {
+      console.error('Error loading room history:', err);
+    }
+
     broadcastRoomUsers(roomId);
   });
 
-  // 收到消息（文字 + 图片）
-  socket.on('sendMessage', (payload) => {
+  // 收到消息
+  socket.on('sendMessage', async (payload) => {
     const { roomId, userName, text, imageUrl } = payload || {};
 
     const cleanedText = (text || '').trim();
     const cleanedImageUrl = (imageUrl || '').trim();
 
-    // 至少要有文字或者图片其中一个
     if (!roomId || (!cleanedText && !cleanedImageUrl)) {
       return;
     }
 
+    const id = genId();
+    const createdAt = new Date();
+
+    try {
+      await pool.query(
+        `INSERT INTO messages (id, room_id, user_name, text, image_url, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          id,
+          roomId,
+          userName || '游客',
+          cleanedText || null,
+          cleanedImageUrl || null,
+          createdAt,
+        ]
+      );
+    } catch (err) {
+      console.error('Error saving message:', err);
+      // 即使保存失败，也不要广播，以免前端以为成功了
+      return;
+    }
+
     const msg = {
-      id: Date.now().toString() + Math.random().toString(36).slice(2),
+      id,
       roomId,
       userName: userName || '游客',
       text: cleanedText,
       imageUrl: cleanedImageUrl,
-      createdAt: new Date().toISOString(),
+      createdAt: createdAt.toISOString(),
     };
 
-    messages.push(msg);
-    saveData(); // ★ 有新消息也保存一下
-
-    // 发送给房间里所有人
     io.to(roomId).emit('newMessage', msg);
   });
 
   socket.on('disconnect', () => {
     console.log('user disconnected', socket.id);
-
-    // 从所有房间里移除这个 socket
     for (const [roomId, users] of Object.entries(roomUsers)) {
       if (users[socket.id]) {
         delete users[socket.id];
