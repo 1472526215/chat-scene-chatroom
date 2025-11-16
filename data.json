@@ -1,0 +1,19 @@
+{
+  "rooms": [
+    {
+      "id": "176327657115289mb7y6fjul",
+      "name": "吃饭",
+      "createdAt": "2025-11-16T07:02:51.152Z"
+    }
+  ],
+  "messages": [
+    {
+      "id": "17632765741146omqzsclrua",
+      "roomId": "176327657115289mb7y6fjul",
+      "userName": "匿名吃货",
+      "text": "111",
+      "imageUrl": "",
+      "createdAt": "2025-11-16T07:02:54.114Z"
+    }
+  ]
+}

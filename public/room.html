@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>聊天室 - Demo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="chat-container">
+    <header class="chat-header">
+      <button class="back-btn" onclick="window.location.href='/'">← 返回</button>
+      <h1 id="roomTitle">聊天室</h1>
+    </header>
+
+    <main id="chatMain" class="chat-main">
+      <ul id="messageList" class="message-list"></ul>
+    </main>
+
+    <footer class="chat-footer">
+      <div class="chat-inputs">
+        <input
+          id="messageInput"
+          type="text"
+          placeholder="说点什么，比如：我在吃麻辣香锅…"
+          autocomplete="off"
+        />
+        <div class="image-row">
+          <label class="upload-btn">
+            选择图片
+            <input id="imageFile" type="file" accept="image/*" />
+          </label>
+          <span id="imageInfo" class="image-info">未选择图片</span>
+        </div>
+      </div>
+      <button id="sendBtn">发送</button>
+    </footer>
+  </div>
+
+  <!-- Socket.IO 客户端脚本，由后端自动提供 -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const roomId = params.get('roomId');
+    const roomName = params.get('roomName') || '聊天室';
+
+    const roomTitle = document.getElementById('roomTitle');
+    const messageList = document.getElementById('messageList');
+    const input = document.getElementById('messageInput');
+    const imageFileInput = document.getElementById('imageFile');
+    const imageInfo = document.getElementById('imageInfo');
+    const sendBtn = document.getElementById('sendBtn');
+
+    roomTitle.textContent = `【${roomName}】聊天室`;
+
+    if (!roomId) {
+      alert('缺少房间 ID');
+    }
+
+    // 简单做个本地昵称
+    let nickname = localStorage.getItem('chatDemoNickname');
+    if (!nickname) {
+      nickname =
+        window.prompt('给自己起个昵称（可以随便写）:', '匿名吃货') || '匿名吃货';
+      localStorage.setItem('chatDemoNickname', nickname);
+    }
+
+    const socket = io();
+
+    // 加入房间
+    socket.emit('joinRoom', roomId);
+
+    // 收到历史消息
+    socket.on('roomHistory', (history) => {
+      history.forEach(addMessageToList);
+      scrollToBottom();
+    });
+
+    // 收到新消息
+    socket.on('newMessage', (msg) => {
+      addMessageToList(msg);
+      scrollToBottom();
+    });
+
+    function formatTime(isoString) {
+      try {
+        const d = new Date(isoString);
+        const h = d.getHours().toString().padStart(2, '0');
+        const m = d.getMinutes().toString().padStart(2, '0');
+        return `${h}:${m}`;
+      } catch {
+        return '';
+      }
+    }
+
+    function addMessageToList(msg) {
+      const li = document.createElement('li');
+      li.className = 'message-item';
+
+      const meta = document.createElement('div');
+      meta.className = 'message-meta';
+      meta.textContent = `${msg.userName} · ${formatTime(msg.createdAt)}`;
+
+      li.appendChild(meta);
+
+      if (msg.text) {
+        const text = document.createElement('div');
+        text.className = 'message-text';
+        text.textContent = msg.text;
+        li.appendChild(text);
+      }
+
+      if (msg.imageUrl) {
+        const img = document.createElement('img');
+        img.className = 'message-image';
+        img.src = msg.imageUrl;
+        img.alt = '图片';
+        li.appendChild(img);
+      }
+
+      messageList.appendChild(li);
+    }
+
+    function scrollToBottom() {
+      const main = document.getElementById('chatMain');
+      main.scrollTop = main.scrollHeight;
+    }
+
+    // 选择图片时，更新显示的文件名
+    imageFileInput.addEventListener('change', () => {
+      const file = imageFileInput.files[0];
+      if (file) {
+        imageInfo.textContent = file.name;
+      } else {
+        imageInfo.textContent = '未选择图片';
+      }
+    });
+
+    // 上传图片到服务器，返回图片 URL
+    async function uploadImage(file) {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      imageInfo.textContent = '图片上传中…';
+
+      try {
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!res.ok) {
+          throw new Error('上传失败');
+        }
+
+        const data = await res.json();
+        imageInfo.textContent = file.name;
+        return data.url;
+      } catch (err) {
+        console.error(err);
+        imageInfo.textContent = '上传失败，请重试';
+        return '';
+      }
+    }
+
+    async function sendMessage() {
+      const text = input.value.trim();
+      const file = imageFileInput.files[0];
+
+      // 至少要有文字或图片一个
+      if (!text && !file) return;
+
+      let imageUrl = '';
+
+      if (file) {
+        imageUrl = await uploadImage(file);
+        if (!imageUrl && !text) {
+          // 图片没上传成功，又没有文字，就不发了
+          return;
+        }
+      }
+
+      socket.emit('sendMessage', {
+        roomId,
+        userName: nickname,
+        text,
+        imageUrl,
+      });
+
+      // 清空输入框和文件选择
+      input.value = '';
+      input.focus();
+      imageFileInput.value = '';
+      imageInfo.textContent = '未选择图片';
+    }
+
+    sendBtn.addEventListener('click', () => {
+      sendMessage();
+    });
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>
