@@ -5,6 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const { Pool } = require('pg');
+const OSS = require('ali-oss');
+
 
 const app = express();
 const server = http.createServer(app);
@@ -48,6 +50,28 @@ const upload = multer({
     fileSize: 5 * 1024 * 1024,
   },
 });
+
+// ====== 阿里云 OSS 客户端 ======
+let ossClient = null;
+
+if (
+  process.env.OSS_REGION &&
+  process.env.OSS_ACCESS_KEY_ID &&
+  process.env.OSS_ACCESS_KEY_SECRET &&
+  process.env.OSS_BUCKET
+) {
+  ossClient = new OSS({
+    region: process.env.OSS_REGION,               // 例如 oss-cn-hangzhou
+    accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+    bucket: process.env.OSS_BUCKET,
+    secure: true,                                 // 确保返回 https 链接 
+  });
+  console.log('OSS client initialized');
+} else {
+  console.warn('OSS config missing, image upload will fall back to local /uploads');
+}
+
 
 // ====== PostgreSQL 连接池 ======
 
@@ -210,13 +234,41 @@ app.get('/api/rooms/:id/messages', async (req, res) => {
 });
 
 // 图片上传接口
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '没有收到文件' });
   }
-  const url = '/uploads/' + req.file.filename;
-  res.json({ url });
+
+  // 先生成本地访问地址（用于本地开发兜底）
+  const localUrl = '/uploads/' + req.file.filename;
+
+  // 如果 OSS 客户端没有配置好，就直接用本地路径
+  if (!ossClient) {
+    return res.json({ url: localUrl });
+  }
+
+  // 阿里云 OSS 对象名就用我们原来的随机文件名
+  const objectKey = req.file.filename; // 例如 173206...-123456789.png
+  const localPath = req.file.path;     // multer 保存的临时文件路径
+
+  try {
+    // 把本地文件上传到 OSS 
+    const result = await ossClient.put(objectKey, localPath);
+
+    // result.url 一般就是 https://bucket.oss-region.aliyuncs.com/objectKey
+    const url = result.url || localUrl;
+
+    // 可选：上传成功后删掉本地临时文件
+    fs.unlink(localPath, () => {});
+
+    res.json({ url });
+  } catch (err) {
+    console.error('上传 OSS 失败:', err);
+    // 出错时至少还能用本地路径
+    res.status(500).json({ error: 'upload_failed', fallbackUrl: localUrl });
+  }
 });
+
 
 // 上传错误处理
 app.use((err, req, res, next) => {
