@@ -91,25 +91,9 @@ const pool = new Pool({
 
 // 启动时保证表存在（双保险，和你手动执行那两条 SQL 一致）
 async function ensureTables() {
-  const sql = `
-  CREATE TABLE IF NOT EXISTS rooms (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    user_name TEXT NOT NULL,
-    text TEXT,
-    image_url TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );
-  `;
-  await pool.query(sql);
-  console.log('DB tables are ready');
+  console.log('Tables are managed manually in DB, skip auto-create.');
 }
+
 
 ensureTables().catch((err) => {
   console.error('Error ensuring tables:', err);
